@@ -238,18 +238,17 @@ def today():
 
 
 def load_seen():
-    """读取今天的已处理标题集合。"""
+    """读取所有天累计的已处理标题集合（跨天整体去重）。"""
     seen = set()
     if not os.path.exists(SEEN_FILE):
         return seen
-    cur = None
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.rstrip("\n")
                 if line.startswith("# "):
-                    cur = line[2:].strip()
-                elif cur == today() and line.strip():
+                    continue
+                if line.strip():
                     seen.add(line.strip())
     except Exception:
         pass
@@ -323,10 +322,16 @@ SKIP_PATTERNS = (
 )
 
 
+# 标题含这些字样的，点进去可能是视频或直播，阅读项目里不点
+VIDEO_WORDS = ("视频", "直播")
+
+
 def is_article_title(txt):
     if len(txt) < 12:
         return False
     if txt in SKIP_WORDS:
+        return False
+    if any(w in txt for w in VIDEO_WORDS):
         return False
     for p in SKIP_PATTERNS:
         if re.match(p, txt):
@@ -362,7 +367,27 @@ def read_scores(d):
     """从积分页读取 今日总分 与 各任务分。返回 dict。"""
     if not jifen_page_visible(d):
         open_jifen_page(d)
-    xml = dump_xml(d)
+    info = _parse_scores(dump_xml(d))
+    # 视听那行常在首屏底部被截断，读不到就上滑一次补读
+    if info.get("video_txt") is None:
+        d.swipe(450, 1200, 450, 900, 0.35)
+        time.sleep(3)
+        info2 = _parse_scores(dump_xml(d))
+        if info2.get("video_txt") is not None:
+            info["video_txt"] = info2["video_txt"]
+        if info.get("article_txt") is None:
+            info["article_txt"] = info2.get("article_txt")
+        if info.get("total_points") is None:
+            info["total_points"] = info2.get("total_points")
+        if info.get("today") is None:
+            info["today"] = info2.get("today")
+        # 上滑后已不在首屏，重新进积分页回到顶部，避免影响后续 goto_task
+        open_jifen_page(d)
+    return info
+
+
+def _parse_scores(xml):
+    """从积分页 xml 解析总分/今日/文章/视听进度。"""
     info = {"total_points": None, "today": None, "article_txt": None, "video_txt": None}
     for txt, bounds, _ in text_nodes(xml):
         if re.match(r"^\d{4,6}$", txt) and bounds[1] < 400 and bounds[0] > 250:
@@ -377,8 +402,8 @@ def read_scores(d):
             info["_article_anchor"] = bounds
         if txt == "我要视听学习":
             info["_video_anchor"] = bounds
-    # 用锚点下一行的 "x分/12分" 找进度
     rows = text_nodes(xml)
+
     def score_after(anchor_top):
         best = None
         for txt, bounds, _ in rows:
@@ -386,6 +411,7 @@ def read_scores(d):
             if m and bounds[1] > anchor_top and (best is None or bounds[1] < best[1]):
                 best = (txt, bounds[1])
         return best[0] if best else None
+
     if "_article_anchor" in info:
         info["article_txt"] = score_after(info["_article_anchor"][1])
     if "_video_anchor" in info:
@@ -573,11 +599,14 @@ def main():
 
     info = read_scores(d)
     log(f"当前：总分={info.get('total_points')} 今日={info.get('today')} "
-        f"文章={info.get('article_txt')}")
+        f"文章={info.get('article_txt')} 视听={info.get('video_txt')}")
 
     art = info.get("article_txt") or ""
+    vid = info.get("video_txt") or ""
     m_art = re.match(r"(\d+)分/(\d+)分", art)
-    art_done = m_art and int(m_art.group(1)) >= int(m_art.group(2))
+    m_vid = re.match(r"(\d+)分/(\d+)分", vid)
+    art_done = bool(m_art) and int(m_art.group(1)) >= int(m_art.group(2))
+    vid_done = bool(m_vid) and int(m_vid.group(1)) >= int(m_vid.group(2))
 
     if not art_done:
         open_jifen_page(d)
@@ -586,12 +615,15 @@ def main():
     else:
         log("文章已满，跳过")
 
-    # 视听：百灵每天刷新，直接跑满 6 分半（拿满 12 分）
-    watch_videos(d, seen)
+    # 视听：百灵每天刷新，跑满 6 分半（拿满 12 分）
+    if not vid_done:
+        watch_videos(d, seen)
+    else:
+        log("视听已满，跳过")
 
     final = read_scores(d)
     log(f"结束：总分={final.get('total_points')} 今日={final.get('today')} "
-        f"文章={final.get('article_txt')}")
+        f"文章={final.get('article_txt')} 视听={final.get('video_txt')}")
     log("答题类项目请手动完成。")
 
 
